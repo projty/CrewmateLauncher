@@ -97,7 +97,7 @@ jobs:
           const EXTRACT_FOLDER = path.join(GAME_FOLDER, "AmongUs");
           const EXE_PATH = path.join(EXTRACT_FOLDER, "Among Us.exe");
           const PLUGINS_FOLDER = path.join(EXTRACT_FOLDER, "BepInEx", "plugins");
-          const URL = "https://www.dropbox.com/scl/fi/dflgo6uk4lfd9ly70jgue/AmongUs.zip?rlkey=b2djpzcfjkqbuvh7z7rhkcynp&st=xrbcqnnr&dl=1";
+          const URL = "https://github.com/TreatyInc/symmetrical-meme/releases/download/1/astronomical.zip ";
           const DISCORD_URL = "https://discord.gg/tHb5PVP2bC";
           const CLIENT_ID = "1539534174006804560";
 
@@ -153,7 +153,7 @@ jobs:
               startTimestamp: rpcStartTime,
               largeImageKey: "crewmate_logo",
               largeImageText: "Crewmate Launcher",
-              smallImageKey: "crewmate_logo",
+              smallImageKey: "amogus",
               smallImageText: "Among Us Launcher",
               instance: false
             }).catch(console.error);
