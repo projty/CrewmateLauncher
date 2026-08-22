@@ -46,7 +46,7 @@ jobs:
             "name": "crewmate-launcher",
             "version": "1.2.2",
             "description": "Among Us Crewmate Launcher",
-            "author": "Crewmate",
+            "author": "Tyler",
             "main": "index.js",
             "scripts": {
               "build:win": "electron-builder --win --x64 --publish=never"
