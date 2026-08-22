@@ -23,7 +23,7 @@ A sleek, minimal launcher for Among Us that handles downloading, extracting, and
 ## Installation
 
 ### Download
-Get the latest installer from the [Releases](https://github.com/reallytyler/node/releases/latest) page.
+Get the latest installer from the [Releases](https://github.com/projty/node/releases/latest) page.
 
 ### Install
 1. Run `Crewmate Launcher Setup.exe`
@@ -41,7 +41,7 @@ Get the latest installer from the [Releases](https://github.com/reallytyler/node
 
 4. When prompted:
   - Click 'I Understand'
-    ![Click I Understand](https://github.com/reallytyler/au-cracked/blob/main/click-i-undestand.png?raw=true)
+    ![Click I Understand](https://github.com/projty/au-cracked/blob/main/click-i-undestand.png?raw=true)
   - Sign in with your Xbox/Microsoft account
   - Enter birthdate (2000+ recommended)
 
@@ -93,7 +93,7 @@ The launcher automatically detects and redownloads corrupted files.
 
 ## Support
 
-- Report issues: [GitHub Issues](https://github.com/reallytyler/CrewmateLauncher/issues)
+- Report issues: [GitHub Issues](https://github.com/projty/CrewmateLauncher/issues)
 - No warranty provided - use at your own risk
 
 ---
