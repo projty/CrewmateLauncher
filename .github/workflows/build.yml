@@ -1,0 +1,1264 @@
+  name: Build Windows EXE
+
+on:
+  push:
+    tags:
+      - v*
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Create icon
+        run: |
+          powershell -Command "
+          Add-Type -AssemblyName System.Drawing;
+          \$bmp = New-Object System.Drawing.Bitmap(256, 256);
+          \$g = [System.Drawing.Graphics]::FromImage(\$bmp);
+          \$g.Clear([System.Drawing.Color]::FromArgb(255, 40, 40, 40));
+          \$font = New-Object System.Drawing.Font('Segoe UI', 72, [System.Drawing.FontStyle]::Bold);
+          \$brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White);
+          \$format = New-Object System.Drawing.StringFormat;
+          \$format.Alignment = [System.Drawing.StringAlignment]::Center;
+          \$format.LineAlignment = [System.Drawing.StringAlignment]::Center;
+          \$g.DrawString('CL', \$font, \$brush, 128, 128, \$format);
+          \$bmp.Save('icon.png', [System.Drawing.Imaging.ImageFormat]::Png);
+          "
+          choco install imagemagick -y
+          magick icon.png -define icon:auto-resize=256,128,64,48,32,16 icon.ico
+
+      - name: Create files
+        run: |
+          # Create package.json
+          echo '{
+            "name": "crewmate-launcher",
+            "version": "1.2.2",
+            "description": "Among Us Crewmate Launcher",
+            "author": "Crewmate",
+            "main": "index.js",
+            "scripts": {
+              "build:win": "electron-builder --win --x64 --publish=never"
+            },
+            "build": {
+              "appId": "com.crewmate.launcher",
+              "productName": "Crewmate Launcher",
+              "directories": { "output": "dist" },
+              "win": { 
+                "target": "nsis",
+                "icon": "icon.ico"
+              },
+              "nsis": {
+                "oneClick": false,
+                "allowToChangeInstallationDirectory": true
+              },
+              "extraResources": [
+                {
+                  "from": "icon.png",
+                  "to": "icon.png"
+                }
+              ]
+            },
+            "dependencies": {
+              "axios": "^1.6.0",
+              "adm-zip": "^0.5.10",
+              "discord-rpc": "^4.0.1"
+            },
+            "devDependencies": {
+              "electron": "^28.0.0",
+              "electron-builder": "^24.9.1"
+            }
+          }' > package.json
+
+          # Create index.js
+          echo 'const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
+          const path = require("path");
+          const fs = require("fs");
+          const axios = require("axios");
+          const AdmZip = require("adm-zip");
+          const { exec, spawn } = require("child_process");
+          const os = require("os");
+          const DiscordRPC = require("discord-rpc");
+
+          const APP_NAME = "crewmate-launcher";
+          const APP_DATA = path.join(os.homedir(), "AppData", "Roaming", APP_NAME);
+          const GAME_FOLDER = path.join(APP_DATA, "Game");
+          const ZIP_NAME = path.join(APP_DATA, "AmongUs.zip");
+          const EXTRACT_FOLDER = path.join(GAME_FOLDER, "AmongUs");
+          const EXE_PATH = path.join(EXTRACT_FOLDER, "Among Us.exe");
+          const PLUGINS_FOLDER = path.join(EXTRACT_FOLDER, "BepInEx", "plugins");
+          const URL = "https://www.dropbox.com/scl/fi/dflgo6uk4lfd9ly70jgue/AmongUs.zip?rlkey=b2djpzcfjkqbuvh7z7rhkcynp&st=xrbcqnnr&dl=1";
+          const DISCORD_URL = "https://discord.gg/tHb5PVP2bC";
+          const CLIENT_ID = "1539534174006804560";
+
+          let mainWindow;
+          let gameProcess = null;
+          let rpc = null;
+          let closeOnLaunch = false;
+          let rpcStartTime = null;
+
+          const MOD_INFO = {
+            "AUnlocker.dll": {
+              name: "All Unlocker",
+              description: "Unlocks all ingame cosmetics. It does not change your game progress on Innersloth Servers."
+            },
+            "ScrollZoomMod.dll": {
+              name: "Scroll Zoom Mod",
+              description: "Scroll to Zoom in and out."
+            }
+          };
+
+          function createWindow() {
+            mainWindow = new BrowserWindow({
+              width: 800,
+              height: 550,
+              resizable: false,
+              frame: false,
+              transparent: true,
+              webPreferences: {
+                nodeIntegration: true,
+                contextIsolation: false
+              }
+            });
+            mainWindow.loadFile("index.html");
+          }
+
+          function initDiscordRPC() {
+            rpc = new DiscordRPC.Client({ transport: "ipc" });
+            
+            rpc.on("ready", () => {
+              rpcStartTime = new Date();
+              updateDiscordRPC("In Launcher", "Browsing menus");
+            });
+
+            rpc.login({ clientId: CLIENT_ID }).catch(console.error);
+          }
+
+          function updateDiscordRPC(details, state) {
+            if (!rpc || !rpcStartTime) return;
+            
+            rpc.setActivity({
+              details: details,
+              state: state,
+              startTimestamp: rpcStartTime,
+              largeImageKey: "crewmate_logo",
+              largeImageText: "Crewmate Launcher",
+              smallImageKey: "crewmate_logo",
+              smallImageText: "Among Us Launcher",
+              instance: false
+            }).catch(console.error);
+          }
+
+          function closeDiscordRPC() {
+            if (rpc) {
+              rpc.destroy().catch(console.error);
+              rpc = null;
+              rpcStartTime = null;
+            }
+          }
+
+          app.whenReady().then(() => {
+            createWindow();
+            fs.mkdirSync(APP_DATA, { recursive: true });
+            fs.mkdirSync(GAME_FOLDER, { recursive: true });
+            fs.mkdirSync(PLUGINS_FOLDER, { recursive: true });
+            
+            // Load settings
+            const settingsPath = path.join(APP_DATA, "settings.json");
+            if (fs.existsSync(settingsPath)) {
+              try {
+                const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+                closeOnLaunch = settings.closeOnLaunch || false;
+              } catch (e) {
+                closeOnLaunch = false;
+              }
+            }
+            
+            initDiscordRPC();
+          });
+
+          app.on("window-all-closed", () => {
+            closeDiscordRPC();
+            if (process.platform !== "darwin") app.quit();
+          });
+
+          app.on("before-quit", () => {
+            closeDiscordRPC();
+          });
+
+          ipcMain.handle("check-game", () => {
+            return fs.existsSync(EXE_PATH);
+          });
+
+          ipcMain.handle("is-game-running", () => {
+            return gameProcess !== null && !gameProcess.killed;
+          });
+
+          ipcMain.handle("open-directory", () => {
+            exec(`start "" "${APP_DATA}"`);
+          });
+
+          ipcMain.handle("open-discord", () => {
+            shell.openExternal(DISCORD_URL);
+          });
+
+          ipcMain.handle("get-close-on-launch", () => {
+            return closeOnLaunch;
+          });
+
+          ipcMain.handle("set-close-on-launch", (event, value) => {
+            closeOnLaunch = value;
+            const settingsPath = path.join(APP_DATA, "settings.json");
+            try {
+              fs.writeFileSync(settingsPath, JSON.stringify({ closeOnLaunch: value }, null, 2));
+              return { success: true };
+            } catch (error) {
+              return { success: false, error: error.message };
+            }
+          });
+
+          ipcMain.handle("get-mods", () => {
+            try {
+              if (!fs.existsSync(PLUGINS_FOLDER)) {
+                return [];
+              }
+              const files = fs.readdirSync(PLUGINS_FOLDER);
+              const mods = [];
+              for (const file of files) {
+                if (file.endsWith(".dll")) {
+                  const info = MOD_INFO[file] || {
+                    name: file.replace(".dll", ""),
+                    description: "Unknown mod"
+                  };
+                  mods.push({
+                    filename: file,
+                    name: info.name,
+                    description: info.description,
+                    path: path.join(PLUGINS_FOLDER, file)
+                  });
+                }
+              }
+              return mods;
+            } catch (error) {
+              return [];
+            }
+          });
+
+          ipcMain.handle("delete-mod", async (event, filename) => {
+            const result = await dialog.showMessageBox(mainWindow, {
+              type: "warning",
+              title: "Delete Mod",
+              message: `Are you sure you want to delete "${filename}"?`,
+              detail: "This will permanently remove the mod file.",
+              buttons: ["Cancel", "Delete"],
+              defaultId: 0,
+              cancelId: 0
+            });
+
+            if (result.response === 1) {
+              try {
+                const modPath = path.join(PLUGINS_FOLDER, filename);
+                if (fs.existsSync(modPath)) {
+                  fs.unlinkSync(modPath);
+                  return { success: true };
+                }
+                return { success: false, error: "File not found" };
+              } catch (error) {
+                return { success: false, error: error.message };
+              }
+            }
+            return { success: false, cancelled: true };
+          });
+
+          ipcMain.handle("delete-game", async () => {
+            const result = await dialog.showMessageBox(mainWindow, {
+              type: "warning",
+              title: "Delete Among Us",
+              message: "Are you sure you want to delete Among Us?",
+              detail: "This will remove all game files from your system.",
+              buttons: ["Cancel", "Delete"],
+              defaultId: 0,
+              cancelId: 0
+            });
+
+            if (result.response === 1) {
+              try {
+                if (fs.existsSync(GAME_FOLDER)) {
+                  fs.rmSync(GAME_FOLDER, { recursive: true, force: true });
+                }
+                if (fs.existsSync(ZIP_NAME)) {
+                  fs.unlinkSync(ZIP_NAME);
+                }
+                return { success: true };
+              } catch (error) {
+                return { success: false, error: error.message };
+              }
+            }
+            return { success: false, cancelled: true };
+          });
+
+          ipcMain.handle("delete-launcher", async () => {
+            const result = await dialog.showMessageBox(mainWindow, {
+              type: "warning",
+              title: "Delete Crewmate Launcher",
+              message: "Are you sure you want to delete Crewmate Launcher?",
+              detail: "This will remove the launcher application. Game files will remain in AppData.",
+              buttons: ["Cancel", "Delete"],
+              defaultId: 0,
+              cancelId: 0
+            });
+
+            if (result.response === 1) {
+              try {
+                const exePath = app.getPath("exe");
+                const appDir = path.dirname(exePath);
+                
+                const batchPath = path.join(os.tmpdir(), "delete_launcher.bat");
+                const batchContent = `@echo off
+          timeout /t 2 /nobreak > nul
+          rmdir /s /q "${appDir}"
+          del /q "${batchPath}"
+          `;
+                fs.writeFileSync(batchPath, batchContent);
+                exec(`start /min "${batchPath}"`);
+                
+                closeDiscordRPC();
+                app.quit();
+                return { success: true };
+              } catch (error) {
+                return { success: false, error: error.message };
+              }
+            }
+            return { success: false, cancelled: true };
+          });
+
+          ipcMain.handle("launch-game", async (event) => {
+            const win = BrowserWindow.getFocusedWindow();
+
+            try {
+              if (fs.existsSync(EXE_PATH)) {
+                win.webContents.send("status", "Launching...", "#ffffff");
+                win.webContents.send("progress", 100);
+                win.webContents.send("game-running", true);
+                
+                updateDiscordRPC("Playing Among Us", "In Game");
+                
+                gameProcess = spawn(EXE_PATH, [], { cwd: EXTRACT_FOLDER, detached: true });
+                
+                gameProcess.on("exit", () => {
+                  gameProcess = null;
+                  updateDiscordRPC("In Launcher", "Browsing menus");
+                  win.webContents.send("game-running", false);
+                  win.webContents.send("status", "Game closed", "#888888");
+                  win.webContents.send("button-text", "Play");
+                });
+                
+                win.webContents.send("status", "Game running!", "#4ade80");
+                win.webContents.send("button-text", "Close Game");
+                
+                if (closeOnLaunch) {
+                  setTimeout(() => {
+                    closeDiscordRPC();
+                    app.quit();
+                  }, 5000);
+                }
+                return;
+              }
+
+              if (fs.existsSync(ZIP_NAME)) {
+                try {
+                  new AdmZip(ZIP_NAME).getEntries();
+                } catch {
+                  win.webContents.send("status", "Corrupted, redownloading...", "#ff6b6b");
+                  fs.unlinkSync(ZIP_NAME);
+                  win.webContents.send("progress", 0);
+                }
+              }
+
+              if (!fs.existsSync(ZIP_NAME)) {
+                win.webContents.send("status", "Downloading...", "#ffffff");
+                win.webContents.send("progress", 5);
+                win.webContents.send("button-text", "PROCESSING");
+                win.webContents.send("show-progress", true);
+                
+                updateDiscordRPC("Downloading Among Us", "Progress: 5%");
+
+                const response = await axios({
+                  method: "get",
+                  url: URL,
+                  responseType: "stream"
+                });
+
+                const total = parseInt(response.headers["content-length"], 10);
+                const writer = fs.createWriteStream(ZIP_NAME);
+                let downloaded = 0;
+
+                response.data.on("data", (chunk) => {
+                  downloaded += chunk.length;
+                  const progress = Math.min(5 + (downloaded/total)*85, 90);
+                  win.webContents.send("progress", progress);
+                  updateDiscordRPC("Downloading Among Us", `Progress: ${Math.floor(progress)}%`);
+                });
+                response.data.pipe(writer);
+                await new Promise((r) => writer.on("finish", r));
+
+                win.webContents.send("status", "Download complete", "#ffffff");
+                win.webContents.send("progress", 90);
+              }
+
+              win.webContents.send("status", "Finalizing...", "#ffffff");
+              win.webContents.send("progress", 92);
+              updateDiscordRPC("Installing Among Us", "Extracting files");
+
+              if (fs.existsSync(EXTRACT_FOLDER)) {
+                fs.rmSync(EXTRACT_FOLDER, { recursive: true, force: true });
+              }
+
+              const zip = new AdmZip(ZIP_NAME);
+              const entries = zip.getEntries();
+              entries.forEach((entry, i) => {
+                if (!entry.isDirectory) {
+                  const fp = path.join(EXTRACT_FOLDER, entry.entryName);
+                  fs.mkdirSync(path.dirname(fp), { recursive: true });
+                  fs.writeFileSync(fp, entry.getData());
+                }
+                if (i % 10 === 0) {
+                  win.webContents.send("progress", Math.min(92 + (i/entries.length)*6, 98));
+                }
+              });
+
+              win.webContents.send("status", "Extract complete", "#ffffff");
+              win.webContents.send("progress", 99);
+
+              if (fs.existsSync(EXE_PATH)) {
+                win.webContents.send("status", "Launching...", "#ffffff");
+                win.webContents.send("progress", 100);
+                win.webContents.send("show-progress", false);
+                
+                updateDiscordRPC("Playing Among Us", "In Game");
+                
+                gameProcess = spawn(EXE_PATH, [], { cwd: EXTRACT_FOLDER, detached: true });
+                
+                gameProcess.on("exit", () => {
+                  gameProcess = null;
+                  updateDiscordRPC("In Launcher", "Browsing menus");
+                  win.webContents.send("game-running", false);
+                  win.webContents.send("status", "Game closed", "#888888");
+                  win.webContents.send("button-text", "Play");
+                });
+                
+                win.webContents.send("status", "Game running!", "#4ade80");
+                win.webContents.send("button-text", "Close Game");
+                win.webContents.send("game-running", true);
+                
+                if (closeOnLaunch) {
+                  setTimeout(() => {
+                    closeDiscordRPC();
+                    app.quit();
+                  }, 5000);
+                }
+              } else {
+                win.webContents.send("status", "Error: Corrupted!", "#ff6b6b");
+                win.webContents.send("button-text", "Download and Play");
+                win.webContents.send("progress", 0);
+                win.webContents.send("show-progress", false);
+                updateDiscordRPC("In Launcher", "Browsing menus");
+              }
+            } catch (error) {
+              win.webContents.send("status", "Error: " + error.message.slice(0, 30), "#ff6b6b");
+              win.webContents.send("button-text", "Download and Play");
+              win.webContents.send("progress", 0);
+              win.webContents.send("show-progress", false);
+              updateDiscordRPC("In Launcher", "Browsing menus");
+            }
+          });
+
+          ipcMain.handle("close-game", async () => {
+            if (gameProcess && !gameProcess.killed) {
+              const result = await dialog.showMessageBox(mainWindow, {
+                type: "warning",
+                title: "Close Among Us",
+                message: "Any unsaved game progress will be lost.",
+                detail: "Are you sure you want to close Among Us?",
+                buttons: ["Cancel", "Close Game"],
+                defaultId: 0,
+                cancelId: 0
+              });
+
+              if (result.response === 1) {
+                gameProcess.kill();
+                gameProcess = null;
+                updateDiscordRPC("In Launcher", "Browsing menus");
+                mainWindow.webContents.send("game-running", false);
+                mainWindow.webContents.send("status", "Game closed", "#888888");
+                mainWindow.webContents.send("button-text", "Play");
+                return { success: true };
+              }
+              return { success: false, cancelled: true };
+            }
+            return { success: false, notRunning: true };
+          });' > index.js
+
+          # Create index.html
+          echo '<!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="UTF-8">
+            <title>Crewmate Launcher</title>
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap" rel="stylesheet">
+            <style>
+              * { margin: 0; padding: 0; box-sizing: border-box; }
+              
+              body {
+                background: rgba(10, 10, 10, 0.95);
+                backdrop-filter: blur(20px);
+                font-family: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+                display: flex;
+                min-height: 100vh;
+                border-radius: 12px;
+                overflow: hidden;
+                user-select: none;
+              }
+
+              .sidebar {
+                width: 70px;
+                background: rgba(20, 20, 20, 0.8);
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                padding: 20px 0;
+                border-right: 1px solid rgba(255,255,255,0.05);
+                gap: 20px;
+              }
+
+              .sidebar-icon {
+                width: 40px;
+                height: 40px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                border-radius: 10px;
+                cursor: pointer;
+                transition: all 0.2s;
+                color: #666;
+                background: transparent;
+                border: none;
+                position: relative;
+                padding: 0;
+              }
+
+              .sidebar-icon svg {
+                width: 22px;
+                height: 22px;
+                stroke: currentColor;
+                fill: none;
+                stroke-width: 2;
+                stroke-linecap: round;
+                stroke-linejoin: round;
+              }
+
+              .sidebar-icon:hover {
+                background: rgba(255,255,255,0.08);
+                color: #fff;
+              }
+
+              .sidebar-icon.active {
+                background: rgba(255,255,255,0.1);
+                color: #fff;
+              }
+
+              .sidebar-icon.active::before {
+                content: "";
+                position: absolute;
+                left: -20px;
+                width: 3px;
+                height: 24px;
+                background: #fff;
+                border-radius: 0 3px 3px 0;
+              }
+
+              .sidebar-spacer {
+                flex: 1;
+              }
+
+              .sidebar-icon-bottom {
+                margin-top: auto;
+              }
+
+              .main-content {
+                flex: 1;
+                padding: 30px 40px;
+                display: flex;
+                flex-direction: column;
+              }
+
+              .window-controls {
+                display: flex;
+                gap: 8px;
+                margin-bottom: 20px;
+                align-items: center;
+              }
+
+              .window-btn {
+                width: 14px;
+                height: 14px;
+                border-radius: 50%;
+                border: none;
+                cursor: pointer;
+                transition: all 0.2s;
+                position: relative;
+              }
+
+              .window-btn.close {
+                background: #ff5f57;
+              }
+              .window-btn.close:hover {
+                opacity: 0.8;
+              }
+              .window-btn.close:hover::after {
+                content: "✕";
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                font-size: 8px;
+                color: #4a0000;
+              }
+
+              .window-btn.minimize {
+                background: #ffbd2e;
+              }
+              .window-btn.minimize:hover {
+                opacity: 0.8;
+              }
+              .window-btn.minimize:hover::after {
+                content: "−";
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                font-size: 10px;
+                color: #5a3d00;
+                font-weight: bold;
+              }
+
+              .window-btn.maximize {
+                background: #28c840;
+              }
+              .window-btn.maximize:hover {
+                opacity: 0.8;
+              }
+              .window-btn.maximize:hover::after {
+                content: "⬡";
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                font-size: 8px;
+                color: #003d0a;
+              }
+
+              .window-title {
+                color: #666;
+                font-size: 13px;
+                margin-left: 12px;
+                font-weight: 500;
+              }
+
+              .content {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                align-items: center;
+                text-align: center;
+              }
+
+              .title {
+                font-size: 42px;
+                font-weight: 900;
+                color: #ffffff;
+                letter-spacing: 2px;
+                margin-bottom: 2px;
+                font-family: "Inter", sans-serif;
+              }
+
+              .subtitle {
+                font-size: 14px;
+                color: #666;
+                margin-bottom: 30px;
+                letter-spacing: 1px;
+                font-weight: 400;
+              }
+
+              .status {
+                font-size: 14px;
+                color: #aaa;
+                margin-bottom: 10px;
+                min-height: 24px;
+                font-weight: 400;
+              }
+
+              .progress-wrap {
+                position: relative;
+                width: 100%;
+                max-width: 400px;
+                margin: 5px 0 20px;
+                display: none;
+              }
+
+              .progress-wrap.visible {
+                display: block;
+              }
+
+              .progress-bg {
+                width: 100%;
+                height: 24px;
+                background: #1a1a1a;
+                border-radius: 20px;
+                overflow: hidden;
+                position: relative;
+              }
+
+              .progress-fill {
+                height: 100%;
+                width: 0%;
+                background: #ffffff;
+                border-radius: 20px;
+                transition: width 0.3s ease;
+              }
+
+              .progress-text {
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                color: #ffffff;
+                font-size: 12px;
+                font-weight: 700;
+                pointer-events: none;
+                font-family: "Inter", sans-serif;
+              }
+
+              .btn-main {
+                width: 100%;
+                max-width: 400px;
+                padding: 16px;
+                background: #ffffff;
+                border: none;
+                border-radius: 30px;
+                font-size: 15px;
+                font-weight: 700;
+                color: #0a0a0a;
+                cursor: pointer;
+                transition: all 0.2s;
+                letter-spacing: 0.5px;
+                margin-bottom: 8px;
+                font-family: "Inter", sans-serif;
+              }
+
+              .btn-main:hover {
+                background: #cccccc;
+                transform: scale(0.98);
+              }
+
+              .btn-main:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+                transform: none;
+              }
+
+              .page {
+                display: none;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                width: 100%;
+                flex: 1;
+              }
+
+              .page.active {
+                display: flex;
+              }
+
+              .settings-group {
+                width: 100%;
+                max-width: 400px;
+                text-align: left;
+                margin-top: 10px;
+              }
+
+              .settings-item {
+                padding: 16px 20px;
+                background: rgba(255,255,255,0.04);
+                border-radius: 12px;
+                margin-bottom: 10px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                cursor: pointer;
+                transition: background 0.2s;
+                border: 1px solid rgba(255,255,255,0.04);
+                font-family: "Inter", sans-serif;
+              }
+
+              .settings-item:hover {
+                background: rgba(255,255,255,0.08);
+              }
+
+              .settings-item .label {
+                color: #ccc;
+                font-size: 14px;
+                font-weight: 500;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+              }
+
+              .settings-item .label .emoji {
+                font-size: 18px;
+                line-height: 1;
+              }
+
+              .settings-item .icon {
+                color: #666;
+                font-size: 18px;
+              }
+
+              .settings-item.danger .label {
+                color: #ff6b6b;
+              }
+
+              .settings-item.danger:hover {
+                border-color: rgba(255,107,107,0.3);
+              }
+
+              .settings-item.discord {
+                border-color: rgba(88, 101, 242, 0.3);
+              }
+
+              .settings-item.discord:hover {
+                border-color: rgba(88, 101, 242, 0.6);
+                background: rgba(88, 101, 242, 0.1);
+              }
+
+              .settings-item.discord .label {
+                color: #5865F2;
+              }
+
+              .delete-mod-btn {
+                background: rgba(255,107,107,0.15);
+                border: none;
+                color: #ff6b6b;
+                padding: 4px 12px;
+                border-radius: 6px;
+                cursor: pointer;
+                font-size: 12px;
+                font-family: "Inter", sans-serif;
+                transition: all 0.2s;
+              }
+
+              .delete-mod-btn:hover {
+                background: rgba(255,107,107,0.25);
+              }
+
+              .toggle-switch {
+                position: relative;
+                width: 40px;
+                height: 20px;
+                background: #333;
+                border-radius: 10px;
+                cursor: pointer;
+                transition: background 0.3s;
+              }
+
+              .toggle-switch.active {
+                background: #4ade80;
+              }
+
+              .toggle-switch::after {
+                content: "";
+                position: absolute;
+                top: 2px;
+                left: 2px;
+                width: 16px;
+                height: 16px;
+                background: white;
+                border-radius: 50%;
+                transition: transform 0.3s;
+              }
+
+              .toggle-switch.active::after {
+                transform: translateX(20px);
+              }
+
+              ::-webkit-scrollbar {
+                width: 4px;
+              }
+              ::-webkit-scrollbar-track {
+                background: transparent;
+              }
+              ::-webkit-scrollbar-thumb {
+                background: #333;
+                border-radius: 4px;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="sidebar">
+              <button class="sidebar-icon active" data-page="home" id="homeBtn" title="Home">
+                <svg viewBox="0 0 24 24">
+                  <path d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0a1 1 0 01-1-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 01-1 1"/>
+                </svg>
+              </button>
+              
+              <button class="sidebar-icon" data-page="mods" id="modsBtn" title="Mods">
+                <svg viewBox="0 0 24 24">
+                  <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                  <path d="M2 17l10 5 10-5"/>
+                  <path d="M2 12l10 5 10-5"/>
+                </svg>
+              </button>
+
+              <div class="sidebar-spacer"></div>
+
+              <button class="sidebar-icon sidebar-icon-bottom" data-page="settings" id="settingsBtn" title="Settings">
+                <svg viewBox="0 0 24 24">
+                  <path d="M12.22 2h-.44a2 2 0 00-2 2v.18a2 2 0 01-1 1.73l-.43.25a2 2 0 01-2 0l-.15-.08a2 2 0 00-2.73.73l-.22.38a2 2 0 00.73 2.73l.15.1a2 2 0 011 1.72v.51a2 2 0 01-1 1.74l-.15.09a2 2 0 00-.73 2.73l.22.38a2 2 0 002.73.73l.15-.08a2 2 0 012 0l.43.25a2 2 0 011 1.73V20a2 2 0 002 2h.44a2 2 0 002-2v-.18a2 2 0 011-1.73l.43-.25a2 2 0 012 0l.15.08a2 2 0 002.73-.73l.22-.39a2 2 0 00-.73-2.73l-.15-.08a2 2 0 01-1-1.74v-.5a2 2 0 011-1.74l.15-.09a2 2 0 00.73-2.73l-.22-.38a2 2 0 00-2.73-.73l-.15.08a2 2 0 01-2 0l-.43-.25a2 2 0 01-1-1.73V4a2 2 0 00-2-2z"/>
+                  <circle cx="12" cy="12" r="3"/>
+                </svg>
+              </button>
+            </div>
+
+            <div class="main-content">
+              <div class="window-controls">
+                <button class="window-btn close" onclick="window.close()"></button>
+                <button class="window-btn minimize" onclick="window.minimize()"></button>
+                <button class="window-btn maximize" onclick="toggleMaximize()"></button>
+                <span class="window-title">Crewmate Launcher</span>
+              </div>
+
+              <div class="page active" id="homePage">
+                <div class="content">
+                  <div class="title">CREWMATE</div>
+                  <div class="subtitle">Your Among Us. Your Launcher.</div>
+                  <div class="status" id="status">Ready to play</div>
+                  <div class="progress-wrap" id="progressWrap">
+                    <div class="progress-bg">
+                      <div class="progress-fill" id="progressFill"></div>
+                      <div class="progress-text" id="progressText">0%</div>
+                    </div>
+                  </div>
+                  <button class="btn-main" id="mainBtn">Download and Play</button>
+                </div>
+              </div>
+
+              <div class="page" id="modsPage">
+                <div class="content">
+                  <div class="title" style="font-size:28px;">🔧</div>
+                  <div class="subtitle">Mods</div>
+                  <div id="modList" style="width:100%; max-width:400px; margin-top:10px; text-align:left;">
+                    <!-- Mods will be rendered here -->
+                  </div>
+                </div>
+              </div>
+
+              <div class="page" id="settingsPage">
+                <div class="content">
+                  <div class="title" style="font-size:28px;">⚙️</div>
+                  <div class="subtitle">Settings</div>
+                  
+                  <div class="settings-group">
+                    <div class="settings-item" id="closeOnLaunchToggle">
+                      <span class="label">
+                        <span class="emoji">🚀</span> Close Launcher on Game Start
+                      </span>
+                      <div class="toggle-switch" id="closeOnLaunchSwitch"></div>
+                    </div>
+
+                    <div class="settings-item discord" id="discordBtn">
+                      <span class="label">
+                        <span class="emoji">💬</span> Discord Community
+                      </span>
+                      <span class="icon">›</span>
+                    </div>
+
+                    <div class="settings-item" id="openDirBtn">
+                      <span class="label">
+                        <span class="emoji">📂</span> Open Local Directory
+                      </span>
+                      <span class="icon">›</span>
+                    </div>
+                    
+                    <div class="settings-item danger" id="deleteGameBtn">
+                      <span class="label">
+                        <span class="emoji">🗑️</span> Delete Among Us
+                      </span>
+                      <span class="icon">›</span>
+                    </div>
+                    
+                    <div class="settings-item danger" id="deleteLauncherBtn">
+                      <span class="label">
+                        <span class="emoji">🗑️</span> Delete Crewmate Launcher
+                      </span>
+                      <span class="icon">›</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <script>
+              const { ipcRenderer } = require("electron");
+
+              const statusEl = document.getElementById("status");
+              const progressFill = document.getElementById("progressFill");
+              const progressText = document.getElementById("progressText");
+              const progressWrap = document.getElementById("progressWrap");
+              const mainBtn = document.getElementById("mainBtn");
+              const homeBtn = document.getElementById("homeBtn");
+              const modsBtn = document.getElementById("modsBtn");
+              const settingsBtn = document.getElementById("settingsBtn");
+              const closeOnLaunchSwitch = document.getElementById("closeOnLaunchSwitch");
+
+              let isGameRunning = false;
+
+              function switchPage(pageId) {
+                document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
+                document.querySelectorAll(".sidebar-icon").forEach(b => b.classList.remove("active"));
+                
+                document.getElementById(pageId + "Page").classList.add("active");
+                document.getElementById(pageId + "Btn").classList.add("active");
+              }
+
+              homeBtn.addEventListener("click", () => switchPage("home"));
+              modsBtn.addEventListener("click", () => {
+                switchPage("mods");
+                renderMods();
+              });
+              settingsBtn.addEventListener("click", () => switchPage("settings"));
+
+              // Load close on launch setting
+              ipcRenderer.invoke("get-close-on-launch").then(value => {
+                if (value) {
+                  closeOnLaunchSwitch.classList.add("active");
+                }
+              });
+
+              closeOnLaunchSwitch.addEventListener("click", () => {
+                const isActive = closeOnLaunchSwitch.classList.toggle("active");
+                ipcRenderer.invoke("set-close-on-launch", isActive);
+              });
+
+              function renderMods() {
+                const modList = document.getElementById("modList");
+                ipcRenderer.invoke("get-mods").then(mods => {
+                  if (mods.length === 0) {
+                    modList.innerHTML = `
+                      <div style="text-align:center; color:#555; padding:20px; font-size:13px; font-family: Inter, sans-serif;">
+                        No mods installed<br>
+                        <span style="font-size:11px; color:#333;">Place .dll files in crewmate-launcher/Game/AmongUs/BepInEx/plugins</span>
+                      </div>
+                    `;
+                    return;
+                  }
+
+                  let html = "";
+                  for (const mod of mods) {
+                    html += `
+                      <div class="settings-item" style="flex-direction:column; align-items:stretch; gap:6px; padding:14px 18px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                          <span class="label" style="font-weight:600; font-size:14px;">${mod.name}</span>
+                          <button class="delete-mod-btn" data-file="${mod.filename}">Delete</button>
+                        </div>
+                        <div style="color:#888; font-size:12px; font-family: Inter, sans-serif;">${mod.description}</div>
+                        <div style="color:#444; font-size:10px; font-family: monospace;">${mod.filename}</div>
+                      </div>
+                    `;
+                  }
+                  modList.innerHTML = html;
+
+                  document.querySelectorAll(".delete-mod-btn").forEach(btn => {
+                    btn.addEventListener("click", async (e) => {
+                      const filename = e.target.dataset.file;
+                      const result = await ipcRenderer.invoke("delete-mod", filename);
+                      if (result.success) {
+                        renderMods();
+                      }
+                    });
+                  });
+                });
+              }
+
+              ipcRenderer.invoke("check-game").then(exists => {
+                if (exists) {
+                  ipcRenderer.invoke("is-game-running").then(running => {
+                    if (!running) {
+                      mainBtn.textContent = "Play";
+                      statusEl.textContent = "Game is ready to launch";
+                      statusEl.style.color = "#ffffff";
+                    }
+                  });
+                }
+              });
+
+              ipcRenderer.invoke("is-game-running").then(running => {
+                if (running) {
+                  isGameRunning = true;
+                  mainBtn.textContent = "Close Game";
+                  statusEl.textContent = "Game running!";
+                  statusEl.style.color = "#4ade80";
+                }
+              });
+
+              ipcRenderer.on("status", (e, text, color) => {
+                statusEl.textContent = text;
+                statusEl.style.color = color || "#aaa";
+              });
+
+              ipcRenderer.on("progress", (e, value) => {
+                progressFill.style.width = value + "%";
+                progressText.textContent = Math.floor(value) + "%";
+              });
+
+              ipcRenderer.on("show-progress", (e, show) => {
+                progressWrap.classList.toggle("visible", show);
+              });
+
+              ipcRenderer.on("button-text", (e, text) => {
+                mainBtn.textContent = text;
+                mainBtn.disabled = false;
+              });
+
+              ipcRenderer.on("game-running", (e, running) => {
+                isGameRunning = running;
+                if (running) {
+                  mainBtn.textContent = "Close Game";
+                  statusEl.textContent = "Game running!";
+                  statusEl.style.color = "#4ade80";
+                } else {
+                  mainBtn.textContent = "Play";
+                  statusEl.textContent = "Game closed";
+                  statusEl.style.color = "#888888";
+                  progressWrap.classList.remove("visible");
+                }
+              });
+
+              mainBtn.addEventListener("click", () => {
+                if (isGameRunning) {
+                  ipcRenderer.invoke("close-game").then(result => {
+                    if (result.success) {
+                      isGameRunning = false;
+                      mainBtn.textContent = "Play";
+                      statusEl.textContent = "Game closed";
+                      statusEl.style.color = "#888888";
+                    }
+                  });
+                } else {
+                  mainBtn.disabled = true;
+                  mainBtn.textContent = "PROCESSING";
+                  ipcRenderer.invoke("launch-game");
+                }
+              });
+
+              document.getElementById("discordBtn").addEventListener("click", () => {
+                ipcRenderer.invoke("open-discord");
+              });
+
+              document.getElementById("openDirBtn").addEventListener("click", () => {
+                ipcRenderer.invoke("open-directory");
+              });
+
+              document.getElementById("deleteGameBtn").addEventListener("click", async () => {
+                const result = await ipcRenderer.invoke("delete-game");
+                if (result.success) {
+                  statusEl.textContent = "Game deleted!";
+                  statusEl.style.color = "#ff6b6b";
+                  mainBtn.textContent = "Download and Play";
+                  progressWrap.classList.remove("visible");
+                }
+              });
+
+              document.getElementById("deleteLauncherBtn").addEventListener("click", async () => {
+                await ipcRenderer.invoke("delete-launcher");
+              });
+
+              function toggleMaximize() {
+                const win = require("electron").remote.getCurrentWindow();
+                if (win.isMaximized()) {
+                  win.unmaximize();
+                } else {
+                  win.maximize();
+                }
+              }
+
+              progressWrap.classList.remove("visible");
+            </script>
+          </body>
+          </html>' > index.html
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npm install -g electron-builder
+
+      - name: Build EXE
+        run: npm run build:win
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: Crewmate-Launcher
+          path: dist/*.exe
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/*.exe
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  notify-discord:
+    name: Notify Discord on Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') && success()
+    steps:
+      - name: Send Discord Notification
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          # Extract release information
+          TAG_VERSION="${{ github.event.release.tag_name }}"
+          RELEASE_NOTE="${{ github.event.release.body }}"
+          RELEASE_URL="${{ github.event.release.html_url }}"
+          
+          # Format message
+          MESSAGE="<@&1539523654411362355>"
+          MESSAGE+="**Release ${TAG_VERSION} has dropped! ** "
+          MESSAGE+="${RELEASE_NOTE} "
+          MESSAGE+="Download it from ${RELEASE_URL} !"
+          
+          # Escape JSON special characters
+          MESSAGE_JSON=$(echo "$MESSAGE" | jq -sRr @json)
+          
+          # Send to Discord
+          curl -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": ${MESSAGE_JSON}}" \
+            "$DISCORD_WEBHOOK_URL"
