@@ -1,6 +1,6 @@
-Copyright (c) 2026 Tyler
+# Copyright (c) 2026 Tyler
 
-All Rights Reserved.
+## All Rights Reserved.
 
 This software and its source code are the exclusive property of Tyler.
 No permission is granted to any person or entity to use, copy, modify,
